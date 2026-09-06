@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Callable
 from datetime import datetime
 from urllib.parse import urlparse
+from google import genai
 
 st.set_page_config(page_title="ThreatLens", page_icon="🔍", layout="wide")
 
@@ -23,11 +24,9 @@ class ProviderResult:
     key_findings: List[str] = field(default_factory=list)
     error_message: Optional[str] = None
 
-# Registry maps target type ("ip", "domain", "url") to a list of provider functions
 PROVIDER_REGISTRY: Dict[str, List[Callable]] = {"ip": [], "domain": [], "url": []}
 
 def register_provider(supported_types: List[str]):
-    """Decorator to register a new intelligence provider."""
     def decorator(func):
         for t in supported_types:
             if t in PROVIDER_REGISTRY:
@@ -37,27 +36,22 @@ def register_provider(supported_types: List[str]):
 
 # --- INPUT VALIDATION & AUTO-DETECTION ---
 def sanitize_input(text: str) -> str:
-    """Strips whitespace and undefangs common safe-formats."""
     text = text.strip()
     text = text.replace("[.]", ".").replace("(.)", ".")
     text = text.replace("hxxp", "http").replace("hXXp", "http")
     return text
 
 def detect_target_type(target: str) -> str:
-    """Determines if the input is an IP, URL, or Domain."""
     target = sanitize_input(target)
     
-    # IPv4/IPv6 Regex
     ipv4_pattern = r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$"
     ipv6_pattern = r"^([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}$"
     if re.match(ipv4_pattern, target) or re.match(ipv6_pattern, target):
         return "ip"
     
-    # URL Regex (Checking for scheme or path)
     if target.startswith("http://") or target.startswith("https://") or "/" in target:
         return "url"
         
-    # Domain Regex (Fallback check for valid FQDN structure)
     domain_pattern = r"^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
     if re.match(domain_pattern, target):
         return "domain"
@@ -67,9 +61,10 @@ def detect_target_type(target: str) -> str:
 # --- PLUGINS: INTELLIGENCE PROVIDERS ---
 
 @register_provider(["ip", "domain", "url"])
-def virustotal_provider(target: str, target_type: str, api_key: Optional[str]) -> ProviderResult:
+def virustotal_provider(target: str, target_type: str, api_keys: dict) -> ProviderResult:
+    api_key = api_keys.get("vt")
     if not api_key:
-        return ProviderResult("VirusTotal", "error", error_message="API Key missing. Please add in sidebar.")
+        return ProviderResult("VirusTotal", "error", error_message="API Key missing in secrets.toml.")
         
     headers = {"x-apikey": api_key}
     base_url = "https://www.virustotal.com/api/v3"
@@ -114,13 +109,12 @@ def virustotal_provider(target: str, target_type: str, api_key: Optional[str]) -
 
 
 @register_provider(["ip", "domain", "url"])
-def whois_provider(target: str, target_type: str, api_key: Optional[str]) -> ProviderResult:
+def whois_provider(target: str, target_type: str, api_keys: dict) -> ProviderResult:
     try:
         findings = []
         raw_data = {}
         status = "clean"
         
-        # If it's a URL, extract the hostname for WHOIS lookup
         if target_type == "url":
             parsed = urlparse(target if "://" in target else f"http://{target}")
             target = parsed.netloc.split(":")[0]
@@ -133,7 +127,7 @@ def whois_provider(target: str, target_type: str, api_key: Optional[str]) -> Pro
             asn = res.get("asn_description", "Unknown")
             findings.append(f"ASN/ISP: {asn}")
             
-        else: # Domain lookup
+        else:
             res = whois.whois(target)
             raw_data = dict(res)
             
@@ -157,6 +151,27 @@ def whois_provider(target: str, target_type: str, api_key: Optional[str]) -> Pro
     except Exception as e:
         return ProviderResult("WHOIS / RDAP", "error", error_message=f"Lookup failed: {str(e)}")
 
+
+@register_provider(["ip", "domain", "url"])
+def gemini_osint_provider(target: str, target_type: str, api_keys: dict) -> ProviderResult:
+    api_key = api_keys.get("gemini")
+    if not api_key:
+        return ProviderResult("Gemini AI OSINT", "error", error_message="Gemini API Key missing in secrets.toml.")
+    
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = f"Act as a cybersecurity threat analyst. Provide a brief, factual 2-sentence OSINT background on this {target_type}: '{target}'. State its typical use cases, known reputation, and if it is a known benign entity (like Google DNS) or associated with threats."
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        
+        return ProviderResult("Gemini AI OSINT", "unknown", 0, 1, {"ai_response": response.text}, [response.text])
+    except Exception as e:
+        return ProviderResult("Gemini AI OSINT", "error", error_message=f"Gemini Analysis Failed: {str(e)}")
+
+
 # --- UI & FORMATTING ENGINE ---
 def render_beginner_view(results: List[ProviderResult]):
     st.subheader("Executive Summary")
@@ -166,9 +181,9 @@ def render_beginner_view(results: List[ProviderResult]):
     if is_malicious:
         st.error("🔴 **DANGER: This target is Malicious.** We highly advise against visiting this link or interacting with this IP/Domain. Close it immediately.")
     elif is_suspicious:
-        st.warning("🟡 **CAUTION: This target is Suspicious.** It has some red flags (e.g., brand new domain, flagged by a few engines). Proceed with extreme caution. Do not enter passwords.")
+        st.warning("🟡 **CAUTION: This target is Suspicious.** It has some red flags. Proceed with extreme caution.")
     else:
-        st.success("🟢 **CLEAN: No immediate threats detected.** Our engines did not find known malicious activity. However, always remain vigilant.")
+        st.success("🟢 **CLEAN: No immediate threats detected.** Our engines did not find known malicious activity.")
         
     st.write("### Key Findings:")
     for r in results:
@@ -211,9 +226,16 @@ def main():
     st.title("🔍 ThreatLens")
     st.markdown("Advanced Threat Intelligence Aggregator with Zero-Touch Extensibility.")
     
+    # Retrieve secrets natively
+    keys = {
+        "vt": st.secrets.get("VT_API_KEY", ""),
+        "gemini": st.secrets.get("GEMINI_API_KEY", "")
+    }
+    
     with st.sidebar:
-        st.header("⚙️ Settings")
-        vt_api_key = st.text_input("VirusTotal API Key", type="password", help="Required for VirusTotal scanning. Get one at virustotal.com")
+        st.header("⚙️ System Status")
+        st.success("✅ Secrets Loaded") if keys["vt"] and keys["gemini"] else st.warning("⚠️ Missing API Keys in secrets.toml")
+        
         st.markdown("---")
         st.markdown("**Active Provider Plugins:**")
         for p_type, providers in PROVIDER_REGISTRY.items():
@@ -226,7 +248,6 @@ def main():
     detected_type = detect_target_type(raw_input) if raw_input else "unknown"
     
     with col2:
-        # Update dropdown dynamically based on auto-detection
         type_options = ["Auto-detect", "ip", "domain", "url"]
         default_idx = 0 if detected_type == "unknown" else type_options.index(detected_type)
         target_type = st.selectbox("Override Type", type_options, index=default_idx)
@@ -243,32 +264,22 @@ def main():
     knowledge_level = st.radio("Display Level:", ["Beginner", "Intermediate", "Expert"], horizontal=True)
     
     if st.button("Scan Target", type="primary", use_container_width=True):
-        if not raw_input:
-            st.warning("Please enter a target to scan.")
-            return
-        if target_type == "unknown":
-            st.warning("Invalid target type.")
+        if not raw_input or target_type == "unknown":
+            st.warning("Please enter a valid target to scan.")
             return
             
         target = sanitize_input(raw_input)
         providers = PROVIDER_REGISTRY.get(target_type, [])
         
-        if not providers:
-            st.error(f"No providers registered for target type: {target_type}")
-            return
-            
         with st.spinner(f"Gathering Threat Intelligence using {len(providers)} providers..."):
             results = []
-            
-            # Orchestrate provider execution concurrently
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future_to_provider = {
-                    executor.submit(p, target, target_type, vt_api_key): p for p in providers
+                    executor.submit(p, target, target_type, keys): p for p in providers
                 }
                 for future in concurrent.futures.as_completed(future_to_provider):
                     try:
-                        res = future.result()
-                        results.append(res)
+                        results.append(future.result())
                     except Exception as e:
                         st.error(f"Provider execution failed: {str(e)}")
 
