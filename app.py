@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Callable
 from datetime import datetime
 from urllib.parse import urlparse
-from google import gemini
+from google import genai
 
 st.set_page_config(page_title="ThreatLens", page_icon="🔍", layout="wide")
 
