@@ -163,7 +163,7 @@ def gemini_osint_provider(target: str, target_type: str, api_keys: dict) -> Prov
         prompt = f"Act as a cybersecurity threat analyst. Provide a brief, factual 2-sentence OSINT background on this {target_type}: '{target}'. State its typical use cases, known reputation, and if it is a known benign entity (like Google DNS) or associated with threats."
         
         response = client.models.generate_content(
-            model='gemini-3.6-flash',
+            model='gemini-3.5-flash',
             contents=prompt,
         )
         
